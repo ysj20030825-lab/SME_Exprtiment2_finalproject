@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 train.py
-
 Smart Mobility Engineering Experiment 2 Final Project
 
 Algorithm:
@@ -10,23 +9,24 @@ Algorithm:
 
 Role:
     1. Load DH_FR1.mat
-    2. Use provided 700 labeled samples
+    2. Use the provided 700 labeled samples
     3. Compute anchor-wise RTT error quantiles
-    4. Validate with 5-fold cross validation
-    5. Save final model parameters to model.npz
+    4. Validate the algorithm with 5-fold cross validation
+    5. Evaluate the final model on all provided 700 samples
+    6. Save final model parameters to model.npz
 
 Required packages:
     numpy
     scipy
 
-No requirements.txt is needed because numpy and scipy are included
-in the standard grading environment.
+No requirements.txt is needed because only numpy and scipy are used.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+
 import numpy as np
 import scipy.io as sio
 
@@ -55,6 +55,7 @@ def load_training_data(mat_path: str):
 
     if "p" not in data:
         raise KeyError("MAT file must contain variable 'p'.")
+
     if "d_hat" not in data:
         raise KeyError("MAT file must contain variable 'd_hat'.")
 
@@ -63,7 +64,7 @@ def load_training_data(mat_path: str):
     elif "p_bs" in data:
         bs_raw = data["p_bs"]
     else:
-        raise KeyError("MAT file must contain variable 'BS_positions'.")
+        raise KeyError("MAT file must contain variable 'BS_positions' or 'p_bs'.")
 
     p = as_2_by_n(data["p"], "p")
     bs = as_2_by_n(bs_raw, "BS_positions")
@@ -108,8 +109,9 @@ def fit_cf_aqarf_model(p: np.ndarray, d_hat: np.ndarray, bs: np.ndarray) -> dict
     Fit CF-AQARF parameters from labeled training data.
 
     The model does not store training labels directly.
-    It stores anchor-wise error quantiles and reliability parameters.
+    It stores anchor-wise RTT error quantiles and reliability parameters.
     """
+
     dist_true = true_distances(p, bs)
     error = d_hat - dist_true
 
@@ -138,8 +140,11 @@ def fit_cf_aqarf_model(p: np.ndarray, d_hat: np.ndarray, bs: np.ndarray) -> dict
 
     error_iqr = np.quantile(error, 0.75, axis=1) - np.quantile(error, 0.25, axis=1)
 
-    sigma_in = np.maximum(6.0, 0.80 * error_iqr + 2.0)
-    sigma_out = np.maximum(3.0, 0.45 * error_iqr + 1.0)
+    # Asymmetric reliability-field penalty.
+    # Since RTT distances tend to have positive bias, an inner violation is allowed
+    # more softly, while an outer violation is penalized more strongly.
+    sigma_in = 1.5 * np.maximum(6.0, 0.80 * error_iqr + 2.0)
+    sigma_out = 0.7 * np.maximum(3.0, 0.45 * error_iqr + 1.0)
 
     cv = np.std(d_hat, axis=0) / (np.mean(np.abs(d_hat), axis=0) + 1e-9)
     cv_low = np.quantile(cv, 0.33)
@@ -162,7 +167,6 @@ def fit_cf_aqarf_model(p: np.ndarray, d_hat: np.ndarray, bs: np.ndarray) -> dict
         "x_max": np.array(x_max),
         "y_min": np.array(y_min),
         "y_max": np.array(y_max),
-
         "coarse_step": np.array(2.0),
         "fine_step": np.array(0.25),
         "fine_half_width": np.array(6.0),
@@ -185,8 +189,8 @@ def scalar(model: dict, key: str) -> float:
 def make_grid(x_min: float, x_max: float, y_min: float, y_max: float, step: float) -> np.ndarray:
     xs = np.arange(x_min, x_max + 0.5 * step, step, dtype=float)
     ys = np.arange(y_min, y_max + 0.5 * step, step, dtype=float)
-    X, Y = np.meshgrid(xs, ys)
-    return np.column_stack((X.ravel(), Y.ravel()))
+    x_grid, y_grid = np.meshgrid(xs, ys)
+    return np.column_stack((x_grid.ravel(), y_grid.ravel()))
 
 
 def choose_band(d: np.ndarray, model: dict) -> int:
@@ -194,8 +198,10 @@ def choose_band(d: np.ndarray, model: dict) -> int:
 
     if cv <= scalar(model, "cv_low"):
         return 0
+
     if cv >= scalar(model, "cv_high"):
         return 2
+
     return 1
 
 
@@ -239,7 +245,12 @@ def soft_centroid(grid: np.ndarray, score: np.ndarray, top_ratio: float, beta: f
     z = beta * (selected_score - np.max(selected_score))
     w = np.exp(z)
 
-    return np.sum(pts * w[:, None], axis=0) / (np.sum(w) + 1e-9)
+    denom = np.sum(w)
+
+    if not np.isfinite(denom) or denom <= 0:
+        return pts[np.argmax(selected_score)]
+
+    return np.sum(pts * w[:, None], axis=0) / denom
 
 
 def predict_one(d: np.ndarray, bs: np.ndarray, model: dict) -> np.ndarray:
@@ -301,8 +312,8 @@ def predict_all(d_hat: np.ndarray, bs: np.ndarray, model: dict) -> np.ndarray:
 
 def linear_ls_position(d: np.ndarray, bs: np.ndarray, k: int = 6) -> np.ndarray:
     idx = np.argsort(d)[:k]
-    ref = idx[0]
 
+    ref = idx[0]
     x1, y1 = bs[:, ref]
     d1 = d[ref]
 
@@ -374,7 +385,7 @@ def make_kfold_indices(n: int, n_folds: int = 5, seed: int = 42):
     return np.array_split(perm, n_folds)
 
 
-def cross_validate(p: np.ndarray, d_hat: np.ndarray, bs: np.ndarray, n_folds: int = 5) -> None:
+def cross_validate(p: np.ndarray, d_hat: np.ndarray, bs: np.ndarray, n_folds: int = 5) -> tuple[np.ndarray, np.ndarray]:
     folds = make_kfold_indices(p.shape[1], n_folds=n_folds, seed=42)
 
     pred_cf = np.zeros_like(p, dtype=float)
@@ -395,15 +406,24 @@ def cross_validate(p: np.ndarray, d_hat: np.ndarray, bs: np.ndarray, n_folds: in
         print(
             f"Fold {fold_id}: "
             f"CF-AQARF MAE={np.mean(fold_error):.3f}, "
-            f"RMSE={np.sqrt(np.mean(fold_error * fold_error)):.3f}"
+            f"RMSE={np.sqrt(np.mean(fold_error * fold_error)):.3f}, "
+            f"P95={np.quantile(fold_error, 0.95):.3f}, "
+            f"Max={np.max(fold_error):.3f}"
         )
 
-    rows = [
-        ("Linear LS K=6", summarize_errors(position_error(p, pred_ls))),
-        ("CF-AQARF", summarize_errors(position_error(p, pred_cf))),
-    ]
+    return pred_cf, pred_ls
 
-    print_metric_table(rows)
+
+def evaluate_final_model_on_training_set(p: np.ndarray, d_hat: np.ndarray, bs: np.ndarray) -> tuple[dict, dict]:
+    model = fit_cf_aqarf_model(p, d_hat, bs)
+
+    pred_cf = predict_all(d_hat, bs, model)
+    pred_ls = predict_linear_ls(d_hat, bs, k=6)
+
+    cf_metrics = summarize_errors(position_error(p, pred_cf))
+    ls_metrics = summarize_errors(position_error(p, pred_ls))
+
+    return cf_metrics, ls_metrics
 
 
 def main() -> None:
@@ -424,15 +444,35 @@ def main() -> None:
 
     print()
     print("5-fold validation. Quantiles are computed only from each train fold.")
-    cross_validate(p, d_hat, bs, n_folds=5)
+
+    pred_cf, pred_ls = cross_validate(p, d_hat, bs, n_folds=5)
+
+    rows_cv = [
+        ("Linear LS K=6 5-fold", summarize_errors(position_error(p, pred_ls))),
+        ("CF-AQARF 5-fold", summarize_errors(position_error(p, pred_cf))),
+    ]
+
+    print_metric_table(rows_cv)
 
     print()
     print("Training final CF-AQARF model on all provided labeled samples.")
 
-    model = fit_cf_aqarf_model(p, d_hat, bs)
-    save_model(model, MODEL_PATH)
+    final_model = fit_cf_aqarf_model(p, d_hat, bs)
+    save_model(final_model, MODEL_PATH)
 
     print(f"Saved final model: {MODEL_PATH}")
+
+    print()
+    print("In-sample check. The final model is trained on all 700 provided samples and evaluated on the same 700 samples.")
+    final_pred = predict_all(d_hat, bs, final_model)
+    final_ls = predict_linear_ls(d_hat, bs, k=6)
+
+    rows_final = [
+        ("Linear LS K=6 all-700", summarize_errors(position_error(p, final_ls))),
+        ("CF-AQARF all-700", summarize_errors(position_error(p, final_pred))),
+    ]
+
+    print_metric_table(rows_final)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 main.py
-
 Smart Mobility Engineering Experiment 2 Final Project
 
 Algorithm:
@@ -21,13 +20,13 @@ main() returns p_hat with shape (2, num_user).
 from __future__ import annotations
 
 from pathlib import Path
+
 import numpy as np
 import scipy.io as sio
 
 
 MAT_PATH = "DH_FR1.mat"
 MODEL_PATH = "model.npz"
-
 _MODEL_CACHE = None
 
 
@@ -54,7 +53,7 @@ def load_input_data(mat_path: str = MAT_PATH):
     elif "p_bs" in data:
         bs_raw = data["p_bs"]
     else:
-        raise KeyError("MAT file must contain variable 'BS_positions'.")
+        raise KeyError("MAT file must contain variable 'BS_positions' or 'p_bs'.")
 
     if "d_hat" not in data:
         raise KeyError("MAT file must contain variable 'd_hat'.")
@@ -102,8 +101,8 @@ def scalar(model: dict, key: str) -> float:
 def make_grid(x_min: float, x_max: float, y_min: float, y_max: float, step: float) -> np.ndarray:
     xs = np.arange(x_min, x_max + 0.5 * step, step, dtype=float)
     ys = np.arange(y_min, y_max + 0.5 * step, step, dtype=float)
-    X, Y = np.meshgrid(xs, ys)
-    return np.column_stack((X.ravel(), Y.ravel()))
+    x_grid, y_grid = np.meshgrid(xs, ys)
+    return np.column_stack((x_grid.ravel(), y_grid.ravel()))
 
 
 def choose_adaptive_band(d: np.ndarray, model: dict) -> int:
@@ -111,8 +110,10 @@ def choose_adaptive_band(d: np.ndarray, model: dict) -> int:
 
     if cv <= scalar(model, "cv_low"):
         return 0
+
     if cv >= scalar(model, "cv_high"):
         return 2
+
     return 1
 
 
